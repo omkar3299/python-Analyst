@@ -1,0 +1,13 @@
+1 .. A deque from the collections module is preferred over a list for implementing a queue because it provides O(1) time complexity for appending and popping elements from both ends, making it more efficient.
+
+
+2.. A real-world scenario where using a stack would be more practical than a list is in managing the function call stack in a program, where each function call is pushed onto the stack, and the most recent call is popped off when it completes, following the Last-In, First-Out (LIFO) principle.
+
+
+3..The primary advantage of using sets in Python is their ability to store unique elements and provide fast O(1) average-time complexity for membership checks, making them most useful in scenarios involving deduplication, checking for existence, or performing mathematical set operations like unions, intersections, and differences
+
+
+4..You might choose to use an array (such as those provided by the array module or NumPy) instead of a list for storing numerical data in Python when you need to perform efficient numerical computations or handle large datasets, as arrays offer benefits like reduced memory usage and faster element-wise operations due to their fixed data type and contiguous memory allocation.
+
+
+5..The primary difference between dictionaries and lists in Python is that dictionaries store data as key-value pairs, allowing for fast O(1) average-time complexity lookups by key, while lists store ordered collections of elements accessed by their index, making dictionaries ideal for scenarios requiring fast access to data based on unique identifiers and lists suitable for ordered sequences or when order of elements matters
