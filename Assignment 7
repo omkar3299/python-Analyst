@@ -1,0 +1,34 @@
+1.. The purpose of the len() function in Python is to return the number of items in a container, such as a list, tuple, or dictionary; when used with strings, len() returns the number of characters in the string, including spaces and special characters 
+
+2.. You can concatenate two or more strings in Python using the + operator or the join() method. Here's an example of string concatenation using both methods:
+string1 = "Hello"
+string2 = "World"
+result = string1 + " " + string2
+print(result)  # Output: Hello World
+
+3.. String slicing in Python is a technique used to extract a specific portion of a string by specifying a range of indices. This is done using the syntax string[start:end], where start is the index of the first character to include, and end is the index of the first character to exclude. Here's an example of string slicing:
+
+text = "Hello, World!"
+slice = text[7:12]  # Extracts characters from index 7 to 11 (end index is exclusive)
+print(slice)  # Output: World 
+
+4.. You can change the case of a string in Python using the upper() method to convert all characters to uppercase and the lower() method to convert all characters to lowercase. Here are examples of both:
+
+Convert to uppercase:
+text = "Hello, World!"
+uppercase_text = text.upper()
+print(uppercase_text)  # Output: HELLO, WORLD!
+
+Convert to lowercase:
+
+text = "Hello, World!"
+lowercase_text = text.lower()
+print(lowercase_text)  # Output: hello, world!
+
+5.. The split() method in Python divides a string into a list of substrings based on a specified delimiter. By default, it splits the string at any whitespace. You can specify a delimiter by passing it as an argument to the split() method. Here are examples:
+
+Using the default delimiter (whitespace):
+
+text = "Hello World Python"
+words = text.split()
+print(words)  # Output: ['Hello', 'World', 'Python']
