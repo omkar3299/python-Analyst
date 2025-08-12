@@ -1,0 +1,417 @@
+"""
+AutoPDFCropper - single-file PyQt5 app
+Features:
+- Load PDF (using PyMuPDF / fitz)
+- Render pages at chosen zoom
+- Let user draw one rectangle (template) on the displayed page (click-drag)
+- Semi-automatic mode: iterate pages, show detected crop (template applied or auto-detected via OpenCV), allow user to accept/save or adjust
+- Full-automatic mode: apply template or auto-detection across all pages and export crops named Q1.png, Q2.png...
+
+Dependencies:
+- PyQt5
+- PyMuPDF (fitz)
+- Pillow
+- OpenCV (cv2)
+- numpy
+
+Install (pip):
+pip install PyQt5 pymupdf pillow opencv-python-headless numpy
+
+Usage:
+- Run this script.
+- Click "Load PDF" and open your file.
+- Use mouse to draw a template rectangle on the page (or skip to use automatic detection).
+- Choose Semi-Auto to step through pages and confirm crops or Full-Auto to export all.
+
+Note: This is a practical starting point and can be refined further (OCR, smarter layout detection, handling multi-column layouts, GUI polish).
+"""
+
+import sys
+import os
+import math
+from PyQt5 import QtCore, QtGui, QtWidgets
+import fitz  # PyMuPDF
+from PIL import Image
+import numpy as np
+import cv2
+
+
+class CropLabel(QtWidgets.QLabel):
+    """QLabel that supports click-drag rectangle drawing and shows an image."""
+    rectChanged = QtCore.pyqtSignal(QtCore.QRect)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.start_pos = None
+        self.end_pos = None
+        self.drawing = False
+        self._pixmap = None
+
+    def setPixmap(self, pm: QtGui.QPixmap):
+        super().setPixmap(pm)
+        self._pixmap = pm
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.start_pos = event.pos()
+            self.end_pos = event.pos()
+            self.drawing = True
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.drawing:
+            self.end_pos = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton and self.drawing:
+            self.end_pos = event.pos()
+            self.drawing = False
+            r = QtCore.QRect(self.start_pos, self.end_pos).normalized()
+            self.rectChanged.emit(r)
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._pixmap and (self.drawing or (self.start_pos and self.end_pos)):
+            painter = QtGui.QPainter(self)
+            pen = QtGui.QPen(QtGui.QColor(0, 180, 0), 2, QtCore.Qt.DashLine)
+            painter.setPen(pen)
+            if self.start_pos and self.end_pos:
+                r = QtCore.QRect(self.start_pos, self.end_pos).normalized()
+                painter.drawRect(r)
+
+
+class AutoPDFCropper(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('AutoPDFCropper')
+        self.resize(1000, 700)
+
+        # PDF related
+        self.doc = None
+        self.current_page_index = 0
+        self.zoom = 2.0  # default 200%
+        self.template_rect = None  # QRect on the displayed widget coordinates
+
+        # UI
+        self.open_btn = QtWidgets.QPushButton('Load PDF')
+        self.zoom_label = QtWidgets.QLabel('Zoom: 200%')
+        self.zoom_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.zoom_slider.setMinimum(50)
+        self.zoom_slider.setMaximum(400)
+        self.zoom_slider.setValue(200)
+        self.prev_btn = QtWidgets.QPushButton('Prev Page')
+        self.next_btn = QtWidgets.QPushButton('Next Page')
+        self.page_label = QtWidgets.QLabel('Page: 0 / 0')
+        self.semiauto_btn = QtWidgets.QPushButton('Semi-Auto Mode')
+        self.auto_btn = QtWidgets.QPushButton('Full-Auto Export')
+        self.export_folder_btn = QtWidgets.QPushButton('Choose Export Folder')
+        self.export_folder_label = QtWidgets.QLabel('Export: ./exports')
+        self.detect_btn = QtWidgets.QPushButton('Auto-detect region on current page')
+
+        self.image_label = CropLabel()
+        self.image_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.image_label.setStyleSheet('background-color: #eee; border: 1px solid #aaa')
+
+        # Layout
+        top_layout = QtWidgets.QHBoxLayout()
+        top_layout.addWidget(self.open_btn)
+        top_layout.addWidget(self.zoom_label)
+        top_layout.addWidget(self.zoom_slider)
+        top_layout.addWidget(self.prev_btn)
+        top_layout.addWidget(self.next_btn)
+        top_layout.addWidget(self.page_label)
+
+        mid_layout = QtWidgets.QHBoxLayout()
+        mid_layout.addWidget(self.semiauto_btn)
+        mid_layout.addWidget(self.auto_btn)
+        mid_layout.addWidget(self.detect_btn)
+        mid_layout.addWidget(self.export_folder_btn)
+        mid_layout.addWidget(self.export_folder_label)
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.addLayout(top_layout)
+        main_layout.addWidget(self.image_label, stretch=1)
+        main_layout.addLayout(mid_layout)
+
+        # Connect signals
+        self.open_btn.clicked.connect(self.load_pdf)
+        self.zoom_slider.valueChanged.connect(self.change_zoom)
+        self.prev_btn.clicked.connect(self.prev_page)
+        self.next_btn.clicked.connect(self.next_page)
+        self.semiauto_btn.clicked.connect(self.start_semiauto)
+        self.auto_btn.clicked.connect(self.start_auto)
+        self.export_folder_btn.clicked.connect(self.choose_export_folder)
+        self.detect_btn.clicked.connect(self.detect_on_current_page)
+        self.image_label.rectChanged.connect(self.on_template_drawn)
+
+        # State
+        self.export_folder = os.path.join(os.getcwd(), 'exports')
+        os.makedirs(self.export_folder, exist_ok=True)
+
+    # ------------------------ PDF Loading & Rendering ------------------------
+    def load_pdf(self):
+        pth, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Open PDF', '', 'PDF Files (*.pdf)')
+        if not pth:
+            return
+        try:
+            self.doc = fitz.open(pth)
+            self.current_page_index = 0
+            self.render_current_page()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to open PDF:\n{e}')
+
+    def render_current_page(self):
+        if not self.doc:
+            return
+        page = self.doc.load_page(self.current_page_index)
+        mat = fitz.Matrix(self.zoom, self.zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        mode = 'RGB'
+        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+        qimg = self.pil2qpixmap(img)
+        self.image_label.setPixmap(qimg)
+        self.page_label.setText(f'Page: {self.current_page_index+1} / {len(self.doc)}')
+
+    def pil2qpixmap(self, pil_image):
+        data = pil_image.tobytes('raw', 'RGB')
+        qimg = QtGui.QImage(data, pil_image.width, pil_image.height, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(qimg)
+        # Fit pixmap to label while keeping scale for coordinate mapping
+        scaled = pix.scaled(self.image_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        return scaled
+
+    def change_zoom(self, val):
+        self.zoom = val / 100.0
+        self.zoom_label.setText(f'Zoom: {val}%')
+        self.render_current_page()
+
+    def prev_page(self):
+        if not self.doc:
+            return
+        if self.current_page_index > 0:
+            self.current_page_index -= 1
+            self.render_current_page()
+
+    def next_page(self):
+        if not self.doc:
+            return
+        if self.current_page_index < len(self.doc) - 1:
+            self.current_page_index += 1
+            self.render_current_page()
+
+    # ------------------------ Template Rectangle Handling ------------------------
+    def on_template_drawn(self, qrect: QtCore.QRect):
+        # store template rect normalized to the displayed pixmap coordinates
+        self.template_rect = qrect
+        QtWidgets.QMessageBox.information(self, 'Template', f'Template set: {qrect.getRect()}')
+
+    def choose_export_folder(self):
+        pth = QtWidgets.QFileDialog.getExistingDirectory(self, 'Choose export folder', self.export_folder)
+        if pth:
+            self.export_folder = pth
+            self.export_folder_label.setText('Export: ' + self.export_folder)
+
+    # ------------------------ Detection & Cropping ------------------------
+    def detect_on_current_page(self):
+        # try auto-detection using image processing and show a preview rectangle
+        crop = self._auto_detect_region(self.current_page_index)
+        if crop is None:
+            QtWidgets.QMessageBox.warning(self, 'Detect', 'No region detected')
+            return
+        # map crop (in pixmap coordinates) to displayed widget coordinates and draw overlay via template_rect
+        self.template_rect = QtCore.QRect(int(crop[0]), int(crop[1]), int(crop[2]-crop[0]), int(crop[3]-crop[1]))
+        QtWidgets.QMessageBox.information(self, 'Detect', f'Auto-detected region set: {self.template_rect.getRect()}')
+
+    def _auto_detect_region(self, page_index):
+        """
+        Strategy:
+        - Render the page at a moderate resolution (using current zoom)
+        - Convert to grayscale, adaptive threshold
+        - Find contours of large text blocks / boxes
+        - Return the bounding box of the largest suitable contour
+        Returns coordinates in the rendered-pixmap space: (x0, y0, x1, y1)
+        """
+        if not self.doc:
+            return None
+        page = self.doc.load_page(page_index)
+        mat = fitz.Matrix(self.zoom, self.zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+        arr = np.array(img)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        # Smooth and threshold
+        blur = cv2.GaussianBlur(gray, (5,5), 0)
+        th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 25, 15)
+        # Morphology to connect lines
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+        morph = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        h, w = gray.shape
+        candidates = []
+        for cnt in contours:
+            x,y,ww,hh = cv2.boundingRect(cnt)
+            area = ww*hh
+            # filter tiny areas
+            if area < 0.01 * w * h:
+                continue
+            # prefer wide blocks (questions usually wide)
+            candidates.append((area, x,y,x+ww,y+hh))
+        if not candidates:
+            return None
+        # choose largest area
+        candidates.sort(reverse=True)
+        _, x0,y0,x1,y1 = candidates[0]
+        # expand a bit
+        pad_x = int(0.02*w)
+        pad_y = int(0.02*h)
+        x0 = max(0, x0-pad_x); y0 = max(0, y0-pad_y)
+        x1 = min(w, x1+pad_x); y1 = min(h, y1+pad_y)
+        return (x0,y0,x1,y1)
+
+    def _pixmap_display_to_source_coords(self, rect: QtCore.QRect, page_index):
+        """
+        Convert a rect drawn on the displayed (scaled) QPixmap to the source pixmap coordinates (rendered image)
+        :param rect: QRect on the QLabel space (where the QPixmap is scaled with KeepAspectRatio)
+        :return: tuple (x0,y0,x1,y1) in source-pixmap coordinates
+        """
+        if not self.doc:
+            return None
+        page = self.doc.load_page(page_index)
+        mat = fitz.Matrix(self.zoom, self.zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        src_w, src_h = pix.width, pix.height
+
+        # The QPixmap is scaled to fit the QLabel with KeepAspectRatio
+        label_w = self.image_label.width()
+        label_h = self.image_label.height()
+        src_ratio = src_w / src_h
+        label_ratio = label_w / label_h
+
+        if src_ratio > label_ratio:
+            # pixmap width fits label width, left/right letterbox
+            displayed_w = label_w
+            displayed_h = int(label_w / src_ratio)
+            offset_x = 0
+            offset_y = (label_h - displayed_h) // 2
+        else:
+            displayed_h = label_h
+            displayed_w = int(label_h * src_ratio)
+            offset_y = 0
+            offset_x = (label_w - displayed_w) // 2
+
+        # rect relative to displayed area
+        x0 = rect.x() - offset_x
+        y0 = rect.y() - offset_y
+        x1 = x0 + rect.width()
+        y1 = y0 + rect.height()
+        # scale from displayed to source
+        if displayed_w <=0 or displayed_h <=0:
+            return None
+        sx = src_w / displayed_w
+        sy = src_h / displayed_h
+        sx0 = int(max(0, x0 * sx))
+        sy0 = int(max(0, y0 * sy))
+        sx1 = int(min(src_w, x1 * sx))
+        sy1 = int(min(src_h, y1 * sy))
+        return (sx0, sy0, sx1, sy1)
+
+    def _save_crop_from_source(self, page_index, bbox, outpath):
+        # bbox is (x0,y0,x1,y1) in source-pixmap coords at current zoom
+        page = self.doc.load_page(page_index)
+        mat = fitz.Matrix(self.zoom, self.zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+        x0,y0,x1,y1 = bbox
+        # Clip
+        x0 = max(0, min(x0, img.width-1))
+        x1 = max(1, min(x1, img.width))
+        y0 = max(0, min(y0, img.height-1))
+        y1 = max(1, min(y1, img.height))
+        if x1 <= x0 or y1 <= y0:
+            return False
+        crop = img.crop((x0,y0,x1,y1))
+        crop.save(outpath)
+        return True
+
+    # ------------------------ Semi-Auto Flow ------------------------
+    def start_semiauto(self):
+        if not self.doc:
+            QtWidgets.QMessageBox.warning(self, 'No PDF', 'Load a PDF first')
+            return
+        # iterate pages, show proposed crop and let user confirm
+        out_dir = os.path.join(self.export_folder, 'semi_auto')
+        os.makedirs(out_dir, exist_ok=True)
+        idx = 0
+        for p in range(len(self.doc)):
+            self.current_page_index = p
+            self.render_current_page()
+            # propose bbox
+            if self.template_rect:
+                bbox = self._pixmap_display_to_source_coords(self.template_rect, p)
+            else:
+                det = self._auto_detect_region(p)
+                if det is None:
+                    # fallback to full page
+                    page = self.doc.load_page(p)
+                    mat = fitz.Matrix(self.zoom, self.zoom)
+                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                    bbox = (0,0,pix.width,pix.height)
+                else:
+                    bbox = det
+            # show a preview message and give options
+            preview = QtWidgets.QMessageBox(self)
+            preview.setWindowTitle(f'Page {p+1}')
+            preview.setText(f'Accept crop for page {p+1}?')
+            preview.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No | QtWidgets.QMessageBox.Cancel)
+            # save temp crop to a file and show as icon
+            tmp = os.path.join(out_dir, f'_tmp_preview_{p+1}.png')
+            self._save_crop_from_source(p, bbox, tmp)
+            if os.path.exists(tmp):
+                preview.setIconPixmap(QtGui.QPixmap(tmp).scaled(400,400, QtCore.Qt.KeepAspectRatio))
+            res = preview.exec_()
+            if res == QtWidgets.QMessageBox.Yes:
+                idx += 1
+                outp = os.path.join(out_dir, f'Q{idx}.png')
+                self._save_crop_from_source(p, bbox, outp)
+            elif res == QtWidgets.QMessageBox.Cancel:
+                break
+            # if No -> skip
+        QtWidgets.QMessageBox.information(self, 'Done', f'Semi-auto done. Output folder: {out_dir}')
+
+    # ------------------------ Full-Auto Flow ------------------------
+    def start_auto(self):
+        if not self.doc:
+            QtWidgets.QMessageBox.warning(self, 'No PDF', 'Load a PDF first')
+            return
+        out_dir = os.path.join(self.export_folder, 'auto')
+        os.makedirs(out_dir, exist_ok=True)
+        idx = 0
+        for p in range(len(self.doc)):
+            if self.template_rect:
+                bbox = self._pixmap_display_to_source_coords(self.template_rect, p)
+            else:
+                det = self._auto_detect_region(p)
+                if det is None:
+                    page = self.doc.load_page(p)
+                    mat = fitz.Matrix(self.zoom, self.zoom)
+                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                    bbox = (0,0,pix.width,pix.height)
+                else:
+                    bbox = det
+            idx += 1
+            outp = os.path.join(out_dir, f'Q{idx}.png')
+            ok = self._save_crop_from_source(p, bbox, outp)
+            if not ok:
+                print(f'Warning: failed to save crop for page {p+1}')
+        QtWidgets.QMessageBox.information(self, 'Done', f'Auto export done. Output folder: {out_dir}')
+
+
+if __name__ == '__main__':
+    app = QtWidgets.QApplication(sys.argv)
+    w = AutoPDFCropper()
+    w.show()
+    sys.exit(app.exec_())
